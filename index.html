@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Javis Pasteleria</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- FontAwesome (Iconos) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- React y ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    
+    <!-- Babel (Para compilar JSX en el navegador) -->
+    <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+    <!-- Firebase (Versión Compat 8.x/10.x para HTML sin compilador) -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+    
+    <style>
+        /* Estilos adicionales para evitar el scroll accidental horizontal */
+        body { overflow-x: hidden; background-color: #FFF9F9; }
+        .pb-safe { padding-bottom: env(safe-area-inset-bottom, 20px); }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo } = React;
+
+        // ==========================================
+        // 1. CONFIGURACIÓN DE FIREBASE Y API
+        // ==========================================
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : {
+                apiKey: "AIzaSyDh3w6i1HRUTuWWI9P1BMeWni5JxIDQ0N8",
+                authDomain: "javis-pasteleria-160626.firebaseapp.com",
+                projectId: "javis-pasteleria-160626",
+                storageBucket: "javis-pasteleria-160626.firebasestorage.app",
+                messagingSenderId: "662827193071",
+                appId: "1:662827193071:web:56021a2bf97f75fac6011a"
+            };
+
+        // Llave de Google Gemini añadida para exportación a GitHub
+        const apiKey = "AQ.Ab8RN6JuoYKcN_Hn2imQx865kBWyYDkzR9c1CLb_0FOp4905Jg"; 
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'javis-pasteleria-160626';
+
+        // Inicializar Firebase
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        const db = firebase.firestore();
+        const auth = firebase.auth();
+        
+        // Helper para usar la ruta estricta requerida por los permisos
+        const getBaseRef = () => db.collection('artifacts').doc(appId).collection('public').doc('data');
+
+        // ==========================================
+        // 2. FUNCIONES DE AYUDA (FECHAS Y OCR)
+        // ==========================================
+        const getTodayStr = () => new Date().toISOString().split('T')[0];
+        const sanitizeId = (name) => name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+
+        const fileToBase64 = (file) => new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+
+        async function callGeminiOCR(base64Image) {
+            // Utilizamos el modelo específico soportado en este entorno para visión
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+            const base64Data = base64Image.split(',')[1];
+            
+            const payload = {
+                contents: [{
+                    role: "user",
+                    parts: [
+                        { text: `Analiza esta imagen de un recibo o boleta de compra. Extrae la siguiente información y devuélvela ESTRICTAMENTE en formato JSON válido, sin texto adicional: {"proveedor": "Nombre del proveedor (string)", "monto": total_pagado (number), "fecha": "YYYY-MM-DD"}` },
+                        { inlineData: { mimeType: "image/jpeg", data: base64Data } }
+                    ]
+                }],
+                generationConfig: { responseMimeType: "application/json" }
+            };
+
+            const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            if (!response.ok) {
+                throw new Error("Error en la respuesta de la IA. Posible falta de API Key.");
+            }
+            const data = await response.json();
+            return JSON.parse(data.candidates[0].content.parts[0].text);
+        }
+
+        // ==========================================
+        // 3. APLICACIÓN PRINCIPAL
+        // ==========================================
+        function App() {
+            const [user, setUser] = useState(null);
+            const [activeTab, setActiveTab] = useState('produccion');
+            
+            // Estados de la base de datos
+            const [inventory, setInventory] = useState({});
+            const [productions, setProductions] = useState([]);
+            const [sales, setSales] = useState([]);
+            const [expenses, setExpenses] = useState([]);
+            const [notification, setNotification] = useState(null);
+
+            const showNotification = (msg, type = 'success') => {
+                setNotification({ msg, type });
+                setTimeout(() => setNotification(null), 3000);
+            };
+
+            // Autenticación de Firebase
+            useEffect(() => {
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await auth.signInWithCustomToken(__initial_auth_token);
+                        } else {
+                            await auth.signInAnonymously();
+                        }
+                    } catch (e) {
+                        console.error("Error de autenticación", e);
+                    }
+                };
+                initAuth();
+                
+                const unsub = auth.onAuthStateChanged(u => setUser(u));
+                return () => unsub();
+            }, []);
+
+            // Escuchar la base de datos en tiempo real
+            useEffect(() => {
+                if (!user) return; // Requiere estar autenticado primero
+
+                const unsubInv = getBaseRef().collection('inventory').onSnapshot(snap => {
+                    const inv = {};
+                    snap.forEach(doc => { inv[doc.id] = doc.data(); });
+                    setInventory(inv);
+                }, err => console.error("Error cargando inventario:", err));
+
+                const unsubProd = getBaseRef().collection('productions').onSnapshot(snap => {
+                    const prods = [];
+                    snap.forEach(doc => prods.push({ id: doc.id, ...doc.data() }));
+                    // Ordenamiento en memoria para evitar errores de Firebase Index
+                    prods.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                    setProductions(prods);
+                }, err => console.error("Error cargando producción:", err));
+
+                const unsubSales = getBaseRef().collection('sales').onSnapshot(snap => {
+                    const s = [];
+                    snap.forEach(doc => s.push({ id: doc.id, ...doc.data() }));
+                    s.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                    setSales(s);
+                }, err => console.error("Error cargando ventas:", err));
+
+                const unsubExp = getBaseRef().collection('expenses').onSnapshot(snap => {
+                    const exp = [];
+                    snap.forEach(doc => exp.push({ id: doc.id, ...doc.data() }));
+                    exp.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                    setExpenses(exp);
+                }, err => console.error("Error cargando gastos:", err));
+
+                return () => { unsubInv(); unsubProd(); unsubSales(); unsubExp(); };
+            }, [user]);
+
+            // === MÓDULO 1: PRODUCCIÓN ===
+            const ProduccionModule = () => {
+                const [formData, setFormData] = useState({ date: getTodayStr(), product: '', qty: '', price: '' });
+                const [loading, setLoading] = useState(false);
+
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    if (!user) return showNotification('Iniciando sesión...', 'error');
+                    setLoading(true);
+                    try {
+                        const slug = sanitizeId(formData.product);
+                        const qtyNum = parseInt(formData.qty);
+                        const priceNum = parseFloat(formData.price);
+
+                        await getBaseRef().collection('productions').add({
+                            date: formData.date, product: formData.product, productSlug: slug,
+                            qty: qtyNum, price: priceNum, timestamp: new Date().toISOString()
+                        });
+
+                        const currentStock = inventory[slug]?.stock || 0;
+                        await getBaseRef().collection('inventory').doc(slug).set({
+                            name: formData.product, stock: currentStock + qtyNum, price: priceNum
+                        });
+
+                        showNotification('Producción registrada con éxito 🍰');
+                        setFormData({ ...formData, product: '', qty: '', price: '' });
+                    } catch (error) {
+                        showNotification('Error al registrar', 'error');
+                        console.error(error);
+                    }
+                    setLoading(false);
+                };
+
+                const handleDeleteStock = async (slug) => {
+                    if (!user) return;
+                    try {
+                        await getBaseRef().collection('inventory').doc(slug).delete();
+                        showNotification('Producto eliminado del stock', 'success');
+                    } catch (e) { showNotification('Error al eliminar', 'error'); }
+                };
+
+                const handleDeleteProduction = async (prod) => {
+                    if (!user) return;
+                    try {
+                        const slug = prod.productSlug || sanitizeId(prod.product);
+                        const currentInv = inventory[slug];
+                        if (currentInv) {
+                            const newStock = Math.max(0, currentInv.stock - prod.qty);
+                            await getBaseRef().collection('inventory').doc(slug).update({ stock: newStock });
+                        }
+                        await getBaseRef().collection('productions').doc(prod.id).delete();
+                        showNotification('Lote de producción anulado', 'success');
+                    } catch (e) { showNotification('Error al anular', 'error'); }
+                };
+
+                return (
+                    <div className="space-y-6 pb-20">
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-pink-100">
+                            <h2 className="text-xl font-bold text-stone-700 mb-4 flex items-center gap-2">
+                                <i className="fa-solid fa-cake-candles text-pink-400"></i> Nuevo Lote
+                            </h2>
+                            <form onSubmit={handleSubmit} className="space-y-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-stone-600 mb-1">Fecha</label>
+                                    <input type="date" required value={formData.date} onChange={e => setFormData({...formData, date: e.target.value})} className="w-full p-3 rounded-xl bg-rose-50 border-none focus:ring-2 focus:ring-pink-300 text-stone-700" />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-stone-600 mb-1">Producto</label>
+                                    <input type="text" required placeholder="Ej. Torta 3 Leches" value={formData.product} onChange={e => setFormData({...formData, product: e.target.value})} className="w-full p-3 rounded-xl bg-rose-50 border-none focus:ring-2 focus:ring-pink-300 text-stone-700" />
+                                </div>
+                                <div className="flex gap-4">
+                                    <div className="flex-1">
+                                        <label className="block text-sm font-medium text-stone-600 mb-1">Unidades</label>
+                                        <input type="number" required min="1" placeholder="0" value={formData.qty} onChange={e => setFormData({...formData, qty: e.target.value})} className="w-full p-3 rounded-xl bg-rose-50 border-none focus:ring-2 focus:ring-pink-300 text-stone-700" />
+                                    </div>
+                                    <div className="flex-1">
+                                        <label className="block text-sm font-medium text-stone-600 mb-1">Precio Venta ($)</label>
+                                        <input type="number" required min="0" placeholder="0" value={formData.price} onChange={e => setFormData({...formData, price: e.target.value})} className="w-full p-3 rounded-xl bg-rose-50 border-none focus:ring-2 focus:ring-pink-300 text-stone-700" />
+                                    </div>
+                                </div>
+                                <button type="submit" disabled={loading} className="w-full py-4 bg-pink-400 hover:bg-pink-500 text-white rounded-2xl font-bold shadow-md transition-colors flex justify-center items-center gap-2">
+                                    {loading ? 'Guardando...' : <><i className="fa-solid fa-plus"></i> Registrar Producción</>}
+                                </button>
+                            </form>
+                        </div>
+
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-pink-100">
+                            <h3 className="text-lg font-bold text-stone-700 mb-4">Stock Actual Disponible</h3>
+                            <div className="grid grid-cols-2 gap-3">
+                                {Object.entries(inventory).filter(([_, item]) => item.stock > 0).map(([slug, item]) => (
+                                    <div key={slug} className="bg-rose-50 p-4 rounded-2xl text-center relative group">
+                                        <button onClick={() => handleDeleteStock(slug)} className="absolute top-2 right-2 p-1.5 text-rose-300 hover:text-rose-500 bg-white rounded-full shadow-sm">
+                                            <i className="fa-solid fa-trash text-xs"></i>
+                                        </button>
+                                        <div className="text-sm text-stone-500 truncate pr-4">{item.name}</div>
+                                        <div className="text-2xl font-black text-pink-400">{item.stock}</div>
+                                    </div>
+                                ))}
+                                {Object.entries(inventory).filter(([_, item]) => item.stock > 0).length === 0 && (
+                                    <div className="col-span-2 text-center text-stone-400 py-4">No hay stock disponible</div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-pink-100">
+                            <h3 className="text-lg font-bold text-stone-700 mb-4">Últimos Lotes (Hoy)</h3>
+                            <div className="space-y-3">
+                                {productions.filter(p => p.date === getTodayStr()).map(prod => (
+                                    <div key={prod.id} className="flex items-center justify-between p-3 bg-stone-50 rounded-2xl border border-stone-100">
+                                        <div>
+                                            <div className="font-bold text-stone-700">{prod.product}</div>
+                                            <div className="text-sm text-stone-500">+{prod.qty} unidades a ${prod.price}</div>
+                                        </div>
+                                        <button onClick={() => handleDeleteProduction(prod)} className="p-3 text-rose-300 hover:text-rose-500 bg-rose-50 rounded-full">
+                                            <i className="fa-solid fa-trash"></i>
+                                        </button>
+                                    </div>
+                                ))}
+                                {productions.filter(p => p.date === getTodayStr()).length === 0 && <div className="text-center text-stone-400 py-4">No hay producciones hoy</div>}
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // === MÓDULO 2: VENTA ===
+            const VentaModule = () => {
+                const [formData, setFormData] = useState({ date: getTodayStr(), productSlug: '', qty: 1, client: '', payment: 'Efectivo', phone: '', mixEfectivo: '', mixTransferencia: '', mixDeuda: '' });
+                const [loading, setLoading] = useState(false);
+                const availableProducts = Object.entries(inventory).filter(([_, item]) => item.stock > 0);
+                const selectedProduct = formData.productSlug ? inventory[formData.productSlug] : null;
+                const total = selectedProduct ? selectedProduct.price * formData.qty : 0;
+
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    if (!user) return showNotification('Iniciando sesión...', 'error');
+                    if (!selectedProduct) return;
+                    if (formData.qty > selectedProduct.stock) { showNotification('No hay suficiente stock', 'error'); return; }
+
+                    let mixDetails = null;
+                    let isDeuda = formData.payment === 'Deuda';
+                    let deudaAmount = 0;
+
+                    // Lógica para pagos divididos
+                    if (formData.payment === 'Mixto') {
+                        const efe = Number(formData.mixEfectivo) || 0;
+                        const trans = Number(formData.mixTransferencia) || 0;
+                        const deu = Number(formData.mixDeuda) || 0;
+                        if (efe + trans + deu !== total) {
+                            showNotification(`La suma de pagos ($${efe + trans + deu}) no coincide con el total ($${total})`, 'error');
+                            return;
+                        }
+                        mixDetails = { efectivo: efe, transferencia: trans, deuda: deu };
+                        if (deu > 0) {
+                            isDeuda = true;
+                            deudaAmount = deu;
+                        }
+                    } else if (formData.payment === 'Deuda') {
+                        deudaAmount = total;
+                    }
+
+                    if (isDeuda && !formData.phone) {
+                        showNotification('El teléfono es obligatorio para registrar la deuda', 'error');
+                        return;
+                    }
+
+                    setLoading(true);
+                    try {
+                        await getBaseRef().collection('sales').add({
+                            date: formData.date, productName: selectedProduct.name, productSlug: formData.productSlug,
+                            qty: Number(formData.qty), price: selectedProduct.price, total: total,
+                            client: formData.client, paymentMethod: formData.payment, mixDetails: mixDetails,
+                            phone: isDeuda ? formData.phone : '',
+                            status: isDeuda ? 'Pendiente' : 'Pagado', deudaAmount: deudaAmount,
+                            timestamp: new Date().toISOString()
+                        });
+                        
+                        await getBaseRef().collection('inventory').doc(formData.productSlug).update({ 
+                            stock: selectedProduct.stock - Number(formData.qty) 
+                        });
+
+                        showNotification('Venta registrada 🛍️');
+                        setFormData({ date: getTodayStr(), productSlug: '', qty: 1, client: '', payment: 'Efectivo', phone: '', mixEfectivo: '', mixTransferencia: '', mixDeuda: '' });
+                    } catch (error) { showNotification('Error al vender', 'error'); console.error(error); }
+                    setLoading(false);
+                };
+
+                const handleDeleteSale = async (sale) => {
+                    if (!user) return;
+                    try {
+                        const currentInv = inventory[sale.productSlug];
+                        if(currentInv) {
+                            await getBaseRef().collection('inventory').doc(sale.productSlug).update({ stock: currentInv.stock + sale.qty });
+                        }
+                        await getBaseRef().collection('sales').doc(sale.id).delete();
+                        showNotification('Venta anulada y stock devuelto', 'success');
+                    } catch (e) { showNotification('Error al anular', 'error'); }
+                };
+
+                return (
+                    <div className="space-y-6 pb-20">
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-emerald-100">
+                            <h2 className="text-xl font-bold text-stone-700 mb-4 flex items-center gap-2">
+                                <i className="fa-solid fa-bag-shopping text-emerald-400"></i> Nueva Venta
+                            </h2>
+                            <form onSubmit={handleSubmit} className="space-y-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-stone-600 mb-1">Producto</label>
+                                    <select required value={formData.productSlug} onChange={e => setFormData({...formData, productSlug: e.target.value})} className="w-full p-3 rounded-xl bg-emerald-50 border-none focus:ring-2 focus:ring-emerald-300 text-stone-700">
+                                        <option value="">Selecciona producto...</option>
+                                        {availableProducts.map(([slug, item]) => (
+                                            <option key={slug} value={slug}>{item.name} (Stock: {item.stock})</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div className="flex gap-4">
+                                    <div className="flex-1">
+                                        <label className="block text-sm font-medium text-stone-600 mb-1">Cantidad</label>
+                                        <input type="number" required min="1" max={selectedProduct?.stock || 999} value={formData.qty} onChange={e => setFormData({...formData, qty: e.target.value})} className="w-full p-3 rounded-xl bg-emerald-50 border-none focus:ring-2 focus:ring-emerald-300 text-stone-700" />
+                                    </div>
+                                    <div className="flex-1">
+                                        <label className="block text-sm font-medium text-stone-600 mb-1">Precio Unit.</label>
+                                        <input type="text" readOnly value={selectedProduct ? `$${selectedProduct.price}` : '-'} className="w-full p-3 rounded-xl bg-stone-100 border-none text-stone-500 cursor-not-allowed" />
+                                    </div>
+                                </div>
+                                <div className="p-4 bg-emerald-100 rounded-2xl flex justify-between items-center">
+                                    <span className="font-bold text-emerald-800">Total a Cobrar:</span>
+                                    <span className="text-2xl font-black text-emerald-600">${total.toLocaleString()}</span>
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-stone-600 mb-1">Cliente</label>
+                                    <input type="text" required placeholder="Nombre del cliente" value={formData.client} onChange={e => setFormData({...formData, client: e.target.value})} className="w-full p-3 rounded-xl bg-emerald-50 border-none focus:ring-2 focus:ring-emerald-300 text-stone-700" />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-stone-600 mb-1">Método de Pago</label>
+                                    <div className="grid grid-cols-4 gap-2">
+                                        {['Efectivo', 'Transferencia', 'Deuda', 'Mixto'].map(method => (
+                                            <button type="button" key={method} onClick={() => setFormData({...formData, payment: method})}
+                                                className={`p-2 rounded-xl text-[11px] sm:text-xs font-bold transition-all ${formData.payment === method ? 'bg-emerald-400 text-white shadow-md' : 'bg-emerald-50 text-emerald-600'}`}>
+                                                {method}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {formData.payment === 'Mixto' && (
+                                    <div className="p-4 bg-emerald-50 rounded-2xl space-y-3 border border-emerald-100">
+                                        <div className="text-sm font-bold text-emerald-700 mb-2">Desglose (Total Venta: ${total})</div>
+                                        <div className="flex items-center gap-2">
+                                            <label className="w-20 text-xs font-medium text-stone-600">Efectivo $</label>
+                                            <input type="number" min="0" value={formData.mixEfectivo} onChange={e => setFormData({...formData, mixEfectivo: e.target.value})} className="flex-1 p-2 rounded-xl border-none focus:ring-2 focus:ring-emerald-300 text-stone-700 text-sm" />
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            <label className="w-20 text-xs font-medium text-stone-600">Transf. $</label>
+                                            <input type="number" min="0" value={formData.mixTransferencia} onChange={e => setFormData({...formData, mixTransferencia: e.target.value})} className="flex-1 p-2 rounded-xl border-none focus:ring-2 focus:ring-emerald-300 text-stone-700 text-sm" />
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            <label className="w-20 text-xs font-medium text-stone-600">Deuda $</label>
+                                            <input type="number" min="0" value={formData.mixDeuda} onChange={e => setFormData({...formData, mixDeuda: e.target.value})} className="flex-1 p-2 rounded-xl border-none focus:ring-2 focus:ring-emerald-300 text-stone-700 text-sm" />
+                                        </div>
+                                    </div>
+                                )}
+
+                                {(formData.payment === 'Deuda' || (formData.payment === 'Mixto' && Number(formData.mixDeuda) > 0)) && (
+                                    <div>
+                                        <label className="block text-sm font-medium text-stone-600 mb-1">Teléfono (para cobranza)</label>
+                                        <input type="tel" required placeholder="+569..." value={formData.phone} onChange={e => setFormData({...formData, phone: e.target.value})} className="w-full p-3 rounded-xl bg-rose-50 border-none focus:ring-2 focus:ring-rose-300 text-stone-700" />
+                                    </div>
+                                )}
+                                <button type="submit" disabled={loading || !selectedProduct} className="w-full py-4 bg-emerald-400 hover:bg-emerald-500 text-white rounded-2xl font-bold shadow-md transition-colors flex justify-center items-center gap-2">
+                                    {loading ? 'Procesando...' : <><i className="fa-solid fa-circle-check"></i> Completar Venta</>}
+                                </button>
+                            </form>
+                        </div>
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-emerald-100">
+                            <h3 className="text-lg font-bold text-stone-700 mb-4">Últimas Ventas (Hoy)</h3>
+                            <div className="space-y-3">
+                                {sales.filter(s => s.date === getTodayStr()).map(sale => (
+                                    <div key={sale.id} className="flex items-center justify-between p-3 bg-stone-50 rounded-2xl border border-stone-100">
+                                        <div>
+                                            <div className="font-bold text-stone-700">{sale.client} <span className="text-xs font-normal text-stone-400">({sale.paymentMethod})</span></div>
+                                            <div className="text-sm text-stone-500">{sale.qty}x {sale.productName}</div>
+                                        </div>
+                                        <div className="flex items-center gap-3">
+                                            <div className="font-black text-emerald-500">${sale.total.toLocaleString()}</div>
+                                            <button onClick={() => handleDeleteSale(sale)} className="p-3 text-rose-300 hover:text-rose-500 bg-rose-50 rounded-full">
+                                                <i className="fa-solid fa-trash"></i>
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+                                {sales.filter(s => s.date === getTodayStr()).length === 0 && <div className="text-center text-stone-400 py-4">No hay ventas hoy</div>}
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // === MÓDULO 3: COBRANZA ===
+            const CobranzaModule = () => {
+                const pendingSales = sales.filter(s => s.status === 'Pendiente');
+                const calculateDays = (dateStr) => Math.floor((new Date() - new Date(dateStr)) / (1000 * 60 * 60 * 24));
+
+                const handleMarkPaid = async (id) => {
+                    if (!user) return;
+                    try {
+                        await getBaseRef().collection('sales').doc(id).update({ status: 'Pagado' });
+                        showNotification('Deuda marcada como pagada 🎉');
+                    } catch (error) { showNotification('Error al actualizar', 'error'); }
+                };
+
+                const sendWhatsApp = (sale) => {
+                    const days = calculateDays(sale.date);
+                    const amountOwed = sale.deudaAmount || sale.total;
+                    const msg = `¡Hola ${sale.client}! 👋 Te escribimos de Javis Pasteleria 🍰. Te recordamos amablemente que tienes un saldo pendiente de $${amountOwed.toLocaleString()} por la compra de ${sale.productName} el día ${sale.date} (${days} días). ¡Cualquier duda nos avisas! Que tengas un lindo día ✨.`;
+                    window.open(`https://wa.me/${sale.phone.replace(/[^0-9]/g, '')}?text=${encodeURIComponent(msg)}`, '_blank');
+                };
+
+                const sendToAll = () => {
+                    if(pendingSales.length === 0) return showNotification('No hay deudas pendientes', 'success');
+                    showNotification("Abriendo WhatsApps... Asegúrate de permitir ventanas emergentes en tu navegador.", "success");
+                    pendingSales.forEach((sale, index) => {
+                        setTimeout(() => {
+                            sendWhatsApp(sale);
+                        }, index * 1000); // 1 sec delay between opens
+                    });
+                };
+
+                return (
+                    <div className="space-y-6 pb-20">
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-amber-100 flex justify-between items-center">
+                            <div>
+                                <h2 className="text-xl font-bold text-stone-700 flex items-center gap-2">
+                                    <i className="fa-solid fa-wallet text-amber-400"></i> Por Cobrar
+                                </h2>
+                                <div className="text-2xl font-black text-amber-500 mt-1">
+                                    ${pendingSales.reduce((sum, s) => sum + (s.deudaAmount || s.total), 0).toLocaleString()}
+                                </div>
+                            </div>
+                            <button onClick={sendToAll} className="bg-amber-100 text-amber-600 p-3 rounded-2xl font-bold flex flex-col items-center shadow-sm">
+                                <i className="fa-solid fa-messages"></i>
+                                <span className="text-[10px]">Recordar Todos</span>
+                            </button>
+                        </div>
+                        <div className="space-y-4">
+                            {pendingSales.map(sale => {
+                                const amountOwed = sale.deudaAmount || sale.total;
+                                return (
+                                <div key={sale.id} className="bg-white p-5 rounded-3xl shadow-sm border border-stone-100 relative overflow-hidden">
+                                    <div className="absolute top-0 right-0 bg-rose-100 text-rose-500 px-3 py-1 text-xs font-bold rounded-bl-xl">
+                                        {calculateDays(sale.date)} días mora
+                                    </div>
+                                    <div className="mb-3">
+                                        <h3 className="font-bold text-lg text-stone-700">{sale.client}</h3>
+                                        <div className="text-sm text-stone-500">{sale.qty}x {sale.productName}</div>
+                                        <div className="font-black text-amber-500 mt-1">${amountOwed.toLocaleString()}</div>
+                                        {sale.paymentMethod === 'Mixto' && <div className="text-xs text-stone-400 mt-1">(Pago Parcial - Total Venta: ${sale.total.toLocaleString()})</div>}
+                                    </div>
+                                    <div className="flex gap-2">
+                                        <a href={`tel:${sale.phone}`} className="flex-1 bg-stone-100 text-stone-600 py-2 rounded-xl flex justify-center items-center gap-2 font-bold hover:bg-stone-200">
+                                            <i className="fa-solid fa-phone"></i> Llamar
+                                        </a>
+                                        <button onClick={() => sendWhatsApp(sale)} className="flex-1 bg-green-100 text-green-600 py-2 rounded-xl flex justify-center items-center gap-2 font-bold hover:bg-green-200">
+                                            <i className="fa-brands fa-whatsapp text-lg"></i> WP
+                                        </button>
+                                        <button onClick={() => handleMarkPaid(sale.id)} className="flex-1 bg-amber-400 text-white py-2 rounded-xl flex justify-center items-center gap-2 font-bold hover:bg-amber-500 shadow-sm">
+                                            <i className="fa-solid fa-circle-check"></i> Pagó
+                                        </button>
+                                    </div>
+                                </div>
+                            )})}
+                            {pendingSales.length === 0 && (
+                                <div className="text-center p-10 text-stone-400 flex flex-col items-center">
+                                    <i className="fa-solid fa-circle-check text-4xl text-stone-200 mb-2"></i>
+                                    <p>¡Todo al día! No hay cobros pendientes.</p>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                );
+            };
+
+            // === MÓDULO 4: GASTOS ===
+            const GastosModule = () => {
+                const [formData, setFormData] = useState({ date: getTodayStr(), provider: '', amount: '', description: '' });
+                const [loading, setLoading] = useState(false);
+                const [ocrLoading, setOcrLoading] = useState(false);
+
+                const handleImageUpload = async (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    setOcrLoading(true);
+                    try {
+                        const base64 = await fileToBase64(file);
+                        const data = await callGeminiOCR(base64);
+                        setFormData(prev => ({
+                            ...prev, provider: data.proveedor || prev.provider, amount: data.monto || prev.amount,
+                            date: data.fecha && data.fecha.match(/^\d{4}-\d{2}-\d{2}$/) ? data.fecha : prev.date
+                        }));
+                        showNotification('¡Datos extraídos con éxito! 🪄');
+                    } catch (error) { showNotification(error.message.includes("API Key") ? "Configura tu API Key de Gemini" : "No se pudo escanear", 'error'); }
+                    setOcrLoading(false);
+                };
+
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    if (!user) return showNotification('Iniciando sesión...', 'error');
+                    setLoading(true);
+                    try {
+                        await getBaseRef().collection('expenses').add({
+                            date: formData.date, provider: formData.provider, amount: parseFloat(formData.amount),
+                            description: formData.description, timestamp: new Date().toISOString()
+                        });
+                        showNotification('Gasto registrado 💸');
+                        setFormData({ date: getTodayStr(), provider: '', amount: '', description: '' });
+                    } catch (error) { showNotification('Error al guardar', 'error'); }
+                    setLoading(false);
+                };
+
+                return (
+                    <div className="space-y-6 pb-20">
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-blue-100">
+                            <h2 className="text-xl font-bold text-stone-700 mb-4 flex items-center justify-between">
+                                <div className="flex items-center gap-2"><i className="fa-solid fa-receipt text-blue-400"></i> Gastos</div>
+                                <label className="bg-blue-100 text-blue-600 px-3 py-2 rounded-xl text-sm font-bold flex items-center gap-2 cursor-pointer hover:bg-blue-200 transition">
+                                    {ocrLoading ? 'Escaneando...' : <><i className="fa-solid fa-camera"></i> Escaneo IA</>}
+                                    <input type="file" accept="image/*" onChange={handleImageUpload} className="hidden" disabled={ocrLoading} />
+                                </label>
+                            </h2>
+                            <form onSubmit={handleSubmit} className="space-y-4">
+                                <div className="flex gap-4">
+                                    <div className="flex-1">
+                                        <label className="block text-sm font-medium text-stone-600 mb-1">Fecha</label>
+                                        <input type="date" required value={formData.date} onChange={e => setFormData({...formData, date: e.target.value})} className="w-full p-3 rounded-xl bg-blue-50 border-none focus:ring-2 focus:ring-blue-300 text-stone-700" />
+                                    </div>
+                                    <div className="flex-1">
+                                        <label className="block text-sm font-medium text-stone-600 mb-1">Monto ($)</label>
+                                        <input type="number" required min="1" placeholder="0" value={formData.amount} onChange={e => setFormData({...formData, amount: e.target.value})} className="w-full p-3 rounded-xl bg-blue-50 border-none font-bold" />
+                                    </div>
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-stone-600 mb-1">Proveedor / Local</label>
+                                    <input type="text" required placeholder="Ej. Supermercado" value={formData.provider} onChange={e => setFormData({...formData, provider: e.target.value})} className="w-full p-3 rounded-xl bg-blue-50 border-none" />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-stone-600 mb-1">Detalle</label>
+                                    <input type="text" placeholder="Ej. Harina..." value={formData.description} onChange={e => setFormData({...formData, description: e.target.value})} className="w-full p-3 rounded-xl bg-blue-50 border-none" />
+                                </div>
+                                <button type="submit" disabled={loading} className="w-full py-4 bg-blue-400 text-white rounded-2xl font-bold flex justify-center items-center gap-2">
+                                    {loading ? 'Guardando...' : <><i className="fa-solid fa-plus"></i> Guardar Gasto</>}
+                                </button>
+                            </form>
+                        </div>
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-blue-100">
+                            <h3 className="text-lg font-bold text-stone-700 mb-4">Últimos Gastos</h3>
+                            <div className="space-y-3">
+                                {expenses.slice(0, 5).map(exp => (
+                                    <div key={exp.id} className="flex items-center justify-between p-3 bg-stone-50 rounded-2xl border border-stone-100">
+                                        <div>
+                                            <div className="font-bold text-stone-700">{exp.provider}</div>
+                                            <div className="text-sm text-stone-500">{exp.date}</div>
+                                        </div>
+                                        <div className="font-black text-rose-500">-${exp.amount.toLocaleString()}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // === MÓDULO 5: BALANCE ===
+            const BalanceModule = () => {
+                const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+                
+                const balanceData = useMemo(() => {
+                    const daysInMonth = new Date(selectedMonth.split('-')[0], selectedMonth.split('-')[1], 0).getDate();
+                    const data = {};
+                    for(let i=1; i<=daysInMonth; i++) {
+                        data[`${selectedMonth}-${String(i).padStart(2, '0')}`] = { sales: 0, expenses: 0 };
+                    }
+                    sales.forEach(sale => { if(data[sale.date]) data[sale.date].sales += sale.total; });
+                    expenses.forEach(exp => { if(data[exp.date]) data[exp.date].expenses += exp.amount; });
+                    return data;
+                }, [sales, expenses, selectedMonth]);
+
+                const totalSales = Object.values(balanceData).reduce((sum, d) => sum + d.sales, 0);
+                const totalExpenses = Object.values(balanceData).reduce((sum, d) => sum + d.expenses, 0);
+                const netProfit = totalSales - totalExpenses;
+
+                return (
+                    <div className="space-y-6 pb-20">
+                        <div className="bg-white p-6 rounded-3xl shadow-sm border border-purple-100">
+                            <div className="flex justify-between items-center mb-6">
+                                <h2 className="text-xl font-bold text-stone-700 flex items-center gap-2">
+                                    <i className="fa-solid fa-chart-pie text-purple-400"></i> Balance Mensual
+                                </h2>
+                                <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="p-2 rounded-xl bg-purple-50 text-purple-700 font-bold border-none" />
+                            </div>
+                            <div className="grid grid-cols-3 gap-2 mb-6 text-center">
+                                <div className="bg-emerald-50 p-3 rounded-2xl">
+                                    <div className="text-xs text-emerald-600 font-bold mb-1">Ingresos</div>
+                                    <div className="font-black text-emerald-500">${totalSales.toLocaleString()}</div>
+                                </div>
+                                <div className="bg-rose-50 p-3 rounded-2xl">
+                                    <div className="text-xs text-rose-600 font-bold mb-1">Gastos</div>
+                                    <div className="font-black text-rose-500">${totalExpenses.toLocaleString()}</div>
+                                </div>
+                                <div className="bg-purple-50 p-3 rounded-2xl">
+                                    <div className="text-xs text-purple-600 font-bold mb-1">Utilidad</div>
+                                    <div className={`font-black ${netProfit >= 0 ? 'text-purple-500' : 'text-rose-500'}`}>${netProfit.toLocaleString()}</div>
+                                </div>
+                            </div>
+                            <div className="overflow-x-auto rounded-xl border border-stone-100">
+                                <table className="w-full text-sm text-left">
+                                    <thead className="bg-stone-50 text-stone-500 uppercase text-xs">
+                                        <tr><th className="px-4 py-3">Día</th><th className="px-4 py-3 text-emerald-500">Ventas</th><th className="px-4 py-3 text-rose-500">Gastos</th><th className="px-4 py-3 text-purple-500">Neto</th></tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-stone-100">
+                                        {Object.entries(balanceData).map(([date, data]) => {
+                                            const net = data.sales - data.expenses;
+                                            if(data.sales === 0 && data.expenses === 0) return null;
+                                            return (
+                                                <tr key={date} className="bg-white">
+                                                    <td className="px-4 py-3 font-bold text-stone-600">{date.split('-')[2]}</td>
+                                                    <td className="px-4 py-3 text-emerald-500">${data.sales.toLocaleString()}</td>
+                                                    <td className="px-4 py-3 text-rose-500">${data.expenses.toLocaleString()}</td>
+                                                    <td className={`px-4 py-3 font-bold ${net >= 0 ? 'text-purple-500' : 'text-rose-500'}`}>${net.toLocaleString()}</td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            // RENDER PRINCIPAL
+            return (
+                <div className="min-h-screen font-sans text-stone-800">
+                    <header className="bg-white sticky top-0 z-20 px-6 py-4 rounded-b-3xl shadow-[0_4px_20px_-10px_rgba(0,0,0,0.05)] flex justify-center items-center">
+                        <h1 className="text-2xl font-black text-pink-400 flex items-center gap-2"><i className="fa-solid fa-cake-candles"></i> Javis Pasteleria</h1>
+                    </header>
+
+                    <main className="p-4 max-w-md mx-auto">
+                        {activeTab === 'produccion' && <ProduccionModule />}
+                        {activeTab === 'venta' && <VentaModule />}
+                        {activeTab === 'cobranza' && <CobranzaModule />}
+                        {activeTab === 'gastos' && <GastosModule />}
+                        {activeTab === 'balance' && <BalanceModule />}
+                    </main>
+
+                    {notification && (
+                        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 animate-bounce">
+                            <div className={`px-6 py-3 rounded-full shadow-lg font-bold text-white flex items-center gap-2 ${notification.type === 'error' ? 'bg-rose-500' : (notification.type === 'info' ? 'bg-blue-500' : 'bg-stone-800')}`}>
+                                <i className={`fa-solid ${notification.type === 'error' ? 'fa-circle-exclamation' : 'fa-circle-check'}`}></i>
+                                {notification.msg}
+                            </div>
+                        </div>
+                    )}
+
+                    <nav className="fixed bottom-0 w-full bg-white border-t border-stone-100 pb-safe z-30">
+                        <div className="flex justify-around items-center p-2 max-w-md mx-auto">
+                            <NavBtn id="produccion" icon="fa-cake-candles" label="Hornos" current={activeTab} set={setActiveTab} color="pink" />
+                            <NavBtn id="venta" icon="fa-bag-shopping" label="Vender" current={activeTab} set={setActiveTab} color="emerald" />
+                            <NavBtn id="cobranza" icon="fa-wallet" label="Deudas" current={activeTab} set={setActiveTab} color="amber" />
+                            <NavBtn id="gastos" icon="fa-receipt" label="Gastos" current={activeTab} set={setActiveTab} color="blue" />
+                            <NavBtn id="balance" icon="fa-chart-pie" label="Balance" current={activeTab} set={setActiveTab} color="purple" />
+                        </div>
+                    </nav>
+                </div>
+            );
+        }
+
+        // COMPONENTE: BOTÓN DE NAVEGACIÓN
+        const NavBtn = ({ id, icon, label, current, set, color }) => {
+            const isActive = current === id;
+            const colorClasses = {
+                pink: isActive ? 'text-pink-500 bg-pink-50' : 'text-stone-400 hover:bg-stone-50',
+                emerald: isActive ? 'text-emerald-500 bg-emerald-50' : 'text-stone-400 hover:bg-stone-50',
+                amber: isActive ? 'text-amber-500 bg-amber-50' : 'text-stone-400 hover:bg-stone-50',
+                blue: isActive ? 'text-blue-500 bg-blue-50' : 'text-stone-400 hover:bg-stone-50',
+                purple: isActive ? 'text-purple-500 bg-purple-50' : 'text-stone-400 hover:bg-stone-50',
+            };
+            return (
+                <button onClick={() => set(id)} className={`flex flex-col items-center justify-center w-16 h-14 rounded-2xl transition-all duration-200 ${colorClasses[color]}`}>
+                    <div className={`transition-transform duration-200 ${isActive ? '-translate-y-1 scale-110' : ''}`}>
+                        <i className={`fa-solid ${icon} text-xl`}></i>
+                    </div>
+                    <span className={`text-[10px] font-bold mt-1 ${isActive ? 'opacity-100' : 'opacity-0 h-0 overflow-hidden'}`}>{label}</span>
+                </button>
+            );
+        };
+
+        // Renderizar la App en el HTML
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
